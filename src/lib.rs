@@ -1205,6 +1205,208 @@ impl Client {
         Ok(())
     }
 
+    /// Downloads a file into the given writer.
+    ///
+    /// # Arguments
+    ///
+    /// * `partial_data_reader`: Reader of the partially downloaded data
+    /// * `start`: Byte offset of the remaining data to download. It should be equal to the size of the partially downloaded data.
+    pub async fn continue_download_node<W: AsyncWrite, R: AsyncRead>(&self, node: &Node, writer: W, partial_data_reader: R, start: u64) -> Result<()> {
+        if start > node.size {
+            return Err(Error::PartialDataSizeMismatchError);
+        }
+        let responses = if let Some(download_id) = node.download_id() {
+            let request = if node.handle.as_str() == download_id {
+                Request::Download {
+                    g: 1,
+                    ssl: if self.state.https { 2 } else { 0 },
+                    n: None,
+                    p: Some(node.handle.clone()),
+                }
+            } else {
+                Request::Download {
+                    g: 1,
+                    ssl: if self.state.https { 2 } else { 0 },
+                    n: Some(node.handle.clone()),
+                    p: None,
+                }
+            };
+
+            self.client
+                .send_requests(&self.state, &[request], &[("n", download_id)])
+                .await?
+        } else {
+            let request = Request::Download {
+                g: 1,
+                ssl: if self.state.https { 2 } else { 0 },
+                p: None,
+                n: Some(node.handle.clone()),
+            };
+
+            self.send_requests(&[request]).await?
+        };
+
+        let response = match responses.as_slice() {
+            [Response::Download(response)] => response,
+            [Response::Error(code)] => {
+                return Err(Error::from(*code));
+            }
+            _ => {
+                return Err(Error::InvalidResponseType);
+            }
+        };
+
+        const AES128_BLOCK_SIZE: u64 = 16;
+
+        // Round down the download offset to the nearest multiple of 16, since AES128 decryption operates on 16-byte blocks.
+        let offset = start & !(AES128_BLOCK_SIZE - 1);
+
+        let url =
+            Url::parse(format!("{0}/{1}-{2}", response.download_url, offset, response.size).as_str())?;
+
+        let mut reader = self.client.get(url).await?.take(node.size - offset);
+
+        let mut file_iv = [0u8; 16];
+
+        file_iv[..8].copy_from_slice(node.aes_iv.unwrap_or_default().as_slice());
+        let mut ctr = ctr::Ctr128BE::<Aes128>::new(node.aes_key[..].into(), (&file_iv).into());
+
+        file_iv[8..].copy_from_slice(node.aes_iv.unwrap_or_default().as_slice());
+
+        let (condensed_mac_reader, condensed_mac_writer) = sluice::pipe::pipe();
+
+        let download_future = async move {
+            let mut chunk_size: u64 = 131_072; // 2^17
+
+            let mut buffer = {
+                let chunk_size = usize::try_from(chunk_size).unwrap();
+                Vec::with_capacity(chunk_size)
+            };
+
+            futures::pin_mut!(writer);
+            futures::pin_mut!(condensed_mac_writer);
+            futures::pin_mut!(partial_data_reader);
+
+            // Compute condensed mac for partially downloaded data.
+            let mut partial_data_bytes = 0u64;
+            let mut overlapped = Vec::with_capacity(AES128_BLOCK_SIZE as usize);
+            loop {
+                buffer.clear();
+
+                let bytes_read = (&mut partial_data_reader)
+                    .take(chunk_size)
+                    .read_to_end(&mut buffer)
+                    .await?;
+
+                if bytes_read == 0 {
+                    break;
+                }
+
+                if partial_data_bytes + bytes_read as u64 > start {
+                    return Err(Error::PartialDataSizeMismatchError);
+                }
+
+                let content = if partial_data_bytes + buffer.len() as u64 > offset {
+                    if partial_data_bytes < offset {
+                        let truncate_pos = (offset - partial_data_bytes) as usize;
+                        overlapped.extend_from_slice(&buffer[truncate_pos..]);
+                        &mut buffer[..truncate_pos]
+                    } else {
+                        overlapped.extend_from_slice(buffer.as_slice());
+                        &mut []
+                    }
+                } else {
+                    buffer.as_mut_slice()
+                };
+                partial_data_bytes += bytes_read as u64;
+
+                if !content.is_empty() {
+                    condensed_mac_writer.write_all(content).await?;
+
+                    // Advance the counter of ctr. Buffer content doesn't matter here.
+                    // TODO: Using apply_keystream() here seems overkill.
+                    ctr.apply_keystream(content);
+                }
+
+                if chunk_size < 1_048_576 {
+                    chunk_size += 131_072;
+                }
+            }
+            if partial_data_bytes != start {
+                return Err(Error::PartialDataSizeMismatchError);
+            }
+
+            if overlapped.len() as u64 != start - offset {
+                // should not happen
+                return Err(Error::PartialDataSizeMismatchError);
+            }
+
+            // Skip the overlapped data when writing to the writer.
+            if !overlapped.is_empty() {
+                buffer.clear();
+
+                let bytes_read = (&mut reader)
+                    .take(AES128_BLOCK_SIZE)
+                    .read_to_end(&mut buffer)
+                    .await?;
+
+                if bytes_read < overlapped.len() {
+                    return Err(Error::PartialDataSizeMismatchError);
+                }
+
+                ctr.apply_keystream(&mut buffer);
+                if overlapped.as_slice() != &buffer[..overlapped.len()] {
+                    return Err(Error::PartialDataMismatchError);
+                }
+                if overlapped.len() < buffer.len() {
+                    writer.write_all(&buffer[overlapped.len()..]).await?;
+                }
+                condensed_mac_writer.write_all(&buffer).await?;
+            }
+
+            loop {
+                buffer.clear();
+
+                let bytes_read = (&mut reader)
+                    .take(chunk_size)
+                    .read_to_end(&mut buffer)
+                    .await?;
+
+                if bytes_read == 0 {
+                    break;
+                }
+
+                ctr.apply_keystream(&mut buffer);
+                writer.write_all(&buffer).await?;
+                condensed_mac_writer.write_all(&buffer).await?;
+
+                if chunk_size < 1_048_576 {
+                    chunk_size += 131_072;
+                }
+            }
+
+            Ok(())
+        };
+
+        let condensed_mac_future = {
+            let size = node.size;
+            let aes_key = node.aes_key;
+            let aes_iv = node.aes_iv.unwrap();
+            async move {
+                fingerprint::compute_condensed_mac(condensed_mac_reader, size, &aes_key, &aes_iv)
+                    .await
+            }
+        };
+
+        let (_, condensed_mac) = futures::try_join!(download_future, condensed_mac_future)?;
+
+        if condensed_mac != node.condensed_mac.unwrap_or_default() {
+            return Err(Error::CondensedMacMismatch);
+        }
+
+        Ok(())
+    }
+
     /// Uploads a file within a parent folder.
     pub async fn upload_node<R: AsyncRead>(
         &self,

@@ -65,6 +65,12 @@ pub enum Error {
     /// The involved event cursors do not match, continuing would result in inconsistencies.
     #[error("the involved event cursors do not match, continuing would result in inconsistencies")]
     EventCursorMismatch,
+    /// The partially downloaded data do not match, continuing would result in inconsistencies.
+    #[error("the partially downloaded data do not match, continuing would result in inconsistencies")]
+    PartialDataMismatchError,
+    /// The partially downloaded data size do not match, continuing would result in inconsistencies.
+    #[error("the partially downloaded data size do not match, continuing would result in inconsistencies")]
+    PartialDataSizeMismatchError,
     /// UTF-8 validation error.
     #[error("UTF-8 validation error: {source}")]
     FromUtf8Error {
