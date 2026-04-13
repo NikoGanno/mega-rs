@@ -979,7 +979,13 @@ impl Client {
 
                             let attrs = {
                                 let mut buffer = BASE64_URL_SAFE_NO_PAD.decode(&file.attr)?;
-                                NodeAttributes::decrypt_and_unpack(&aes_key, buffer.as_mut_slice())?
+                                match NodeAttributes::decrypt_and_unpack(&aes_key, buffer.as_mut_slice()) {
+                                    Ok(attrs) => attrs,
+                                    Err(err) => {
+                                        eprintln!("Failed to decrypt attributes for node {}: {err}", file.handle);
+                                        continue;
+                                    }
+                                }
                             };
 
                             let (thumbnail_handle, preview_image_handle) = file

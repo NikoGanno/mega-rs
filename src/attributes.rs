@@ -6,7 +6,7 @@ use json::Value;
 use serde::{Deserialize, Serialize};
 
 use crate::fingerprint::NodeFingerprint;
-use crate::Result;
+use crate::{Error, Result};
 
 /// Represents the node's attributes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,6 +30,10 @@ impl NodeAttributes {
         let mut cbc = cbc::Decryptor::<Aes128>::new(file_key.into(), &<_>::default());
         for chunk in buffer.chunks_exact_mut(16) {
             cbc.decrypt_block_mut(chunk.into());
+        }
+
+        if &buffer[..4] != b"MEGA" {
+            return Err(Error::Other { source: format!("Invalid node attributes: missing MEGA prefix").into() });
         }
 
         assert_eq!(&buffer[..4], b"MEGA");
