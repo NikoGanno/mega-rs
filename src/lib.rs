@@ -922,43 +922,62 @@ impl Client {
                                 continue;
                             };
 
-                            let Some(mut file_key) = file_key.split('/').find_map(|key| {
-                                let (_, file_key) = key.split_once(':')?;
+                            // file_key may contain multiple keys.
+                            // Find the correct one with trial & error.
+                            let mut candidate_keys = Vec::new();
 
-                                if file_key.len() >= 44 {
-                                    // Keys bigger than this size are using RSA instead of AES.
-                                    // We don't support this as of right now.
-                                    todo!();
+                            for part in file_key.split('/') {
+                                if let Some((_, pure_key_str)) = part.split_once(':') {
+                                    if pure_key_str.len() >= 44 {
+                                        continue; // RSA is unsupported yet
+                                    }
+
+                                    if let Ok(mut dec_file_key) = BASE64_URL_SAFE_NO_PAD.decode(pure_key_str) {
+                                        utils::decrypt_ebc_in_place(&node_key, &mut dec_file_key);
+
+                                        if (file.kind.is_file() && dec_file_key.len() == FILE_KEY_SIZE)
+                                            || (!file.kind.is_file() && dec_file_key.len() == FOLDER_KEY_SIZE)
+                                        {
+                                            candidate_keys.push(dec_file_key);
+                                        }
+                                    }
                                 }
+                            }
 
-                                let mut file_key = BASE64_URL_SAFE_NO_PAD.decode(file_key).ok()?;
+                            let mut final_attrs = None;
+                            let mut final_node_key = None;
 
-                                // File keys are 32 bytes and folder keys are 16 bytes.
-                                // Other sizes are considered invalid.
-                                if (file.kind.is_file() && file_key.len() != FILE_KEY_SIZE)
-                                    || (!file.kind.is_file() && file_key.len() != FOLDER_KEY_SIZE)
-                                {
-                                    return None;
+                            let buffer = match BASE64_URL_SAFE_NO_PAD.decode(&file.attr) {
+                                Ok(b) => b,
+                                Err(_) => continue,
+                            };
+
+                            // find a key that can decrypt node attrs
+                            for test_key in candidate_keys {
+                                let attr_aes_key: [u8; 16] = if test_key.len() == 32 {
+                                    let mut k = [0u32; 8];
+                                    for i in 0..8 { k[i] = u32::from_be_bytes(test_key[i*4 .. i*4+4].try_into().unwrap()); }
+                                    let attr_k = [k[0]^k[4], k[1]^k[5], k[2]^k[6], k[3]^k[7]];
+                                    let mut kb = [0u8; 16];
+                                    for i in 0..4 { kb[i*4 .. i*4+4].copy_from_slice(&attr_k[i].to_be_bytes()); }
+                                    kb
+                                } else {
+                                    test_key.as_slice().try_into().unwrap()
+                                };
+
+                                // try to decrype node attrs
+                                let mut temp_buffer = buffer.clone();
+                                if let Ok(unpacked_attrs) = NodeAttributes::decrypt_and_unpack(&attr_aes_key, temp_buffer.as_mut_slice()) {
+                                    final_attrs = Some(unpacked_attrs);
+                                    final_node_key = Some(test_key);
+                                    break;
                                 }
+                            }
 
-                                // TODO: MEGA includes in its web client a check to see if both halves of `file_key`
-                                //       are identical to each other. This is apparently done to prevent an attacker from
-                                //       being able to produce an all-zeroes AES key (by XOR-ing the two halves after EBC decryption).
-                                //       It's a bit unclear what we should do in our specific case, so it isn't yet implemented here.
-                                //
-                                //       Here would be how to implement such a check:
-                                //       ```
-                                //       if !self.state.allow_null_keys {
-                                //           let (fst, snd) = file_key.split_at(16);
-                                //           if fst == snd {
-                                //               return None;
-                                //           }
-                                //       }
-                                //       ```
-
-                                utils::decrypt_ebc_in_place(&node_key, &mut file_key);
-                                Some(file_key)
-                            }) else {
+                            let Some(mut file_key) = final_node_key else {
+                                continue;
+                            };
+                            let Some(attrs) = final_attrs else {
                                 continue;
                             };
 
@@ -975,17 +994,6 @@ impl Client {
                                 )
                             } else {
                                 (file_key.try_into().unwrap(), None, None)
-                            };
-
-                            let attrs = {
-                                let mut buffer = BASE64_URL_SAFE_NO_PAD.decode(&file.attr)?;
-                                match NodeAttributes::decrypt_and_unpack(&aes_key, buffer.as_mut_slice()) {
-                                    Ok(attrs) => attrs,
-                                    Err(err) => {
-                                        eprintln!("Failed to decrypt attributes for node {}: {err}", file.handle);
-                                        continue;
-                                    }
-                                }
                             };
 
                             let (thumbnail_handle, preview_image_handle) = file
